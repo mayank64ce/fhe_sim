@@ -52,7 +52,7 @@ def _simulate_entry(entry: CalibrationEntry, arch: ArchParam) -> float:
         arch        = arch,
     )
     result = sim.run()
-    return result.predicted_latency_s
+    return result.latency.predicted_latency_s
 
 
 def _build_arch(

@@ -23,13 +23,16 @@ from .arch_params import (
     ASIC_ARCH,
 )
 from .cost_model import PredictionResult
-from .simulator import Simulator
+from .accuracy import AccuracyResult
+from .simulator import Simulator, SimulationResult
 from .calibrate import calibrate
 from .types import OpType, FHEOp, FHEType, OpCount
 from .config import FHEConfig, load_config
 
 __all__ = [
     "Simulator",
+    "SimulationResult",
+    "AccuracyResult",
     "ArchParam",
     "CacheStyle",
     "PredictionResult",

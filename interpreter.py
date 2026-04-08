@@ -224,6 +224,13 @@ class Interpreter:
     # Declaration handler
     # ------------------------------------------------------------------
 
+    def _should_store_value(self, fhe_t: FHEType, val) -> bool:
+        """Whether to store a computed value in ctx.env.
+        Base class: only store plain scalars (for constant folding).
+        Override in subclasses to store ciphertext slot vectors too.
+        """
+        return val is not None and fhe_t == FHEType.PLAIN
+
     def _exec_declaration(self, node: Node, ctx: ExecContext):
         type_node = node.child_by_field_name("type")
         type_str  = _text(type_node) if type_node else ""
@@ -240,7 +247,7 @@ class Interpreter:
                         ctx.level_env[name] = self._initial_level
                     if val_node is not None:
                         val, vt, vlvl = self._eval_expr(val_node, ctx)
-                        if val is not None and fhe_t == FHEType.PLAIN:
+                        if self._should_store_value(fhe_t, val):
                             ctx.env[name] = val
                         if vt not in (FHEType.PLAIN, FHEType.UNKNOWN):
                             ctx.type_env[name] = vt
@@ -458,7 +465,8 @@ class Interpreter:
                     result = {
                         "+": lv + rv, "-": lv - rv,
                         "*": lv * rv,
-                        "/": int(lv / rv),
+                        "/": (lv // rv if isinstance(lv, int) and isinstance(rv, int)
+                              else lv / rv),
                         "%": int(lv) % int(rv),
                     }.get(op)
                     return result, fhe_t, lvl
@@ -476,7 +484,7 @@ class Interpreter:
             if lhs_name:
                 if fhe_t not in (FHEType.PLAIN, FHEType.UNKNOWN):
                     ctx.type_env[lhs_name] = fhe_t
-                if fhe_t == FHEType.PLAIN and val is not None:
+                if self._should_store_value(fhe_t, val):
                     ctx.env[lhs_name] = val
             if lvl_key and fhe_t == FHEType.CIPHERTEXT and lvl is not None:
                 ctx.level_env[lvl_key] = lvl
