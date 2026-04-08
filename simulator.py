@@ -1,4 +1,5 @@
 from __future__ import annotations
+import json
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional, Union
@@ -45,14 +46,14 @@ class Simulator:
     # Latency only
     result = sim.run()
 
-    # Latency + accuracy
+    # Latency + accuracy from test_case.json
+    result = sim.run(test_case="tests/testcase1/test_case.json")
+
+    # Latency + accuracy from raw arrays
     result = sim.run(
-        plaintext_input="testcase1/plaintext_input.txt",
-        expected_output="testcase1/expected_output.txt",
+        plaintext_input=np.array([...]),
+        expected_output=np.array([...]),
     )
-    print(result)
-    print(result.latency.predicted_latency_s)
-    print(result.accuracy.correct_ratio)
     """
 
     def __init__(
@@ -69,28 +70,37 @@ class Simulator:
 
     def run(
         self,
+        test_case:        Optional[Union[str, Path]] = None,
         plaintext_input:  Optional[Union[str, Path, np.ndarray]] = None,
         expected_output:  Optional[Union[str, Path, np.ndarray]] = None,
         accuracy_threshold: float = 0.001,
+        run_index:        int = 0,
     ) -> SimulationResult:
         """
         Run the simulator.
 
-        If plaintext_input is provided, runs both latency and accuracy branches.
-        Otherwise, runs latency only (original behavior).
-
         Parameters
         ----------
+        test_case          : path to test_case.json (extracts input, output,
+                             and threshold automatically)
         plaintext_input    : path to plaintext_input.txt or numpy array
+                             (ignored if test_case is provided)
         expected_output    : path to expected_output.txt or numpy array
+                             (ignored if test_case is provided)
         accuracy_threshold : per-slot error threshold for correct_ratio metric
+                             (overridden by test_case if it contains one)
+        run_index          : which run to use from test_case.json (default: 0)
         """
+        # If test_case.json is provided, extract input/output from it
+        if test_case is not None:
+            plaintext_input, expected_output, accuracy_threshold = \
+                self._load_test_case(test_case, run_index, accuracy_threshold)
+
         config       = load_config(str(self.config_file))
         member_types = extract_member_types(self.header_file.read_text())
         cpp_src      = self.cpp_file.read_text()
 
         if plaintext_input is not None:
-            # Unified path: numerical interpreter gives both op_log and accuracy
             input_slots = self._load_array(plaintext_input)
             num_interp = NumericalInterpreter(
                 member_types           = member_types,
@@ -101,10 +111,8 @@ class Simulator:
             )
             op_log = num_interp.run(cpp_src)
 
-            # Latency from the same op_log
             latency = CostModel(self.arch).predict(op_log, config)
 
-            # Accuracy
             if num_interp.output_slots is not None:
                 exp = (self._load_array(expected_output)
                        if expected_output is not None else None)
@@ -122,7 +130,6 @@ class Simulator:
             return SimulationResult(latency=latency, accuracy=accuracy)
 
         else:
-            # Latency-only path (original behavior)
             interp = Interpreter(
                 member_types           = member_types,
                 initial_level          = config.mult_depth,
@@ -131,6 +138,45 @@ class Simulator:
             op_log = interp.run(cpp_src)
             latency = CostModel(self.arch).predict(op_log, config)
             return SimulationResult(latency=latency)
+
+    @staticmethod
+    def _load_test_case(
+        path: Union[str, Path],
+        run_index: int = 0,
+        default_threshold: float = 0.001,
+    ) -> tuple[np.ndarray, np.ndarray, float]:
+        """
+        Load input/output from a test_case.json file.
+
+        Format (matches white_box challenge format):
+        [{
+            "scheme": "CKKS",
+            "significant_slots_number": 16384,
+            "accuracy_threshold": 0.001,         // optional
+            "runs": [{
+                "input": [{"name": "x", "value": [...]}],
+                "output": [...]
+            }]
+        }]
+
+        Returns (plaintext_input, expected_output, threshold) as numpy arrays.
+        """
+        with open(str(path)) as f:
+            data = json.load(f)
+
+        tc = data[0]
+        run = tc["runs"][run_index]
+
+        # Input: first input vector
+        plaintext_input = np.array(run["input"][0]["value"], dtype=np.float64)
+
+        # Output
+        expected_output = np.array(run["output"], dtype=np.float64)
+
+        # Threshold
+        threshold = tc.get("accuracy_threshold", default_threshold)
+
+        return plaintext_input, expected_output, threshold
 
     @staticmethod
     def _load_array(source: Union[str, Path, np.ndarray]) -> np.ndarray:
