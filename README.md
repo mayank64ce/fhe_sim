@@ -1,76 +1,99 @@
-# fhe_sim — SimFHE-style FHE Latency Simulator
+# fhe_sim — FHE Latency + Accuracy Simulator
 
 ## 1. Overview
 
-`fhe_sim` predicts the wall-clock latency of an OpenFHE `eval()` function on
-a parameterised hardware target, using a roofline cost model.
+`fhe_sim` predicts **latency** and **accuracy** of an OpenFHE CKKS `eval()`
+function without compiling or running any FHE code.
 
-**How it works:**
-
-1. `fhe_sim`'s C++ interpreter parses your `eval()` function and produces an
-   ordered log of FHE operations (`EvalMult`, `EvalRotate`, etc.) with their
-   ciphertext levels.
-2. `fhe_sim`'s cost model maps each operation to a `Cost` object that
-   accumulates hardware cycles (`add_cyc`, `mult_cyc`, `auto_cyc`, `ntt_cyc`)
-   and DRAM bytes (`dram_rd`, `dram_wr`, `dram_key_rd`) following the
-   SimFHE/poly.py and SimFHE/evaluator.py pipeline models.
-3. The roofline model separates compute and memory:
-   - `compute_time = total_cycles / (clock_freq_GHz × 10^9)`
-   - `memory_time  = total_dram_bytes / (memory_bandwidth_GBps × 10^9)`
-   - `predicted_latency = max(compute_time, memory_time)`
-
-**Key formula** (from SimFHE):
+**Two branches from one parse:**
 
 ```
-add_cyc  = N × limbs / (funits × sets) + add_lat
-mult_cyc = N × limbs / (funits × sets) + mult_lat
+  C++ eval() source
+       │
+       ▼
+  ┌──────────┐
+  │  Parser  │  (tree-sitter → AST)
+  └────┬─────┘
+       │
+       ├──────────────────┐
+       ▼                  ▼
+  ┌──────────┐     ┌───────────┐
+  │ Latency  │     │ Accuracy  │
+  │ Predictor│     │ Simulator │
+  └──────────┘     └───────────┘
+       │                 │
+       ▼                 ▼
+  predicted         predicted output
+  wall-clock (s)    + accuracy metrics
 ```
 
-Cost is **not** a weighted sum — compute and memory are kept separate so the
-bottleneck is identified by `max()`.
+**Latency branch:** The C++ interpreter produces an ordered log of FHE
+operations with ciphertext levels. The cost model maps each operation to
+hardware cycles and DRAM bytes following the SimFHE pipeline model. A
+roofline model combines compute and memory time into a wall-clock prediction.
 
-**Differences from `fhe_sim`:**
+**Accuracy branch:** A numerical interpreter executes the same operations
+on plaintext float vectors (numpy arrays) — the CKKS analog of Concrete ML's
+simulate mode for TFHE. No encryption, no polynomials, just slot-level
+arithmetic. Produces predicted output values that can be compared to ground
+truth for accuracy metrics (MAE, max error, correct slot percentage).
 
-| Feature | fhe_sim | fhe_sim |
-|---------|---------|---------|
-| Output | Op counts | Latency in seconds |
-| Hardware model | None | ArchParam (cycles + DRAM) |
-| Cost accumulation | Counter | Explicit `Cost` objects |
-| Calibration | No | Yes (scipy Nelder-Mead) |
-| Presets | No | CPU, GPU, ASIC |
+### What you need
+
+| File | Description |
+|------|-------------|
+| `solution.cpp` | C++ file containing the `eval()` method |
+| `solution.h` | Header declaring the class with member types |
+| `config.json` | FHE scheme parameters (mult_depth, ring_dimension, etc.) |
+
+Optional for accuracy: `plaintext_input.txt` and `expected_output.txt`
+(one float per line, one per CKKS slot).
+
+### What you do NOT need
+
+- No OpenFHE installation
+- No Docker or compilation
+- No encrypted keys or ciphertexts
 
 ---
 
 ## 2. Quick Start
 
+### Latency only
+
 ```python
-from fhe_sim import Simulator, GPU_ARCH, CPU_ARCH, ASIC_ARCH
+from fhe_sim import Simulator
 
-# Predict latency on a GPU
-sim = Simulator(
-    cpp_file    = "path/to/yourSolution.cpp",
-    header_file = "path/to/yourSolution.h",
-    config_file = "path/to/config.json",
-    arch        = GPU_ARCH,
-)
+sim = Simulator("solution.cpp", "solution.h", "config.json")
 result = sim.run()
-print(result)
-# === fhe_sim Prediction ===
-# Predicted latency :  12.345 ms
-#   Compute time    :   8.210 ms
-#   Memory time     :  12.345 ms
-#   Bottleneck      : memory
-# ...
 
-# Access individual fields
-print(f"Predicted: {result.predicted_latency_s * 1e3:.2f} ms")
-print(f"Bottleneck: {result.bottleneck}")
+print(result.latency.predicted_latency_s)  # seconds
+print(result.latency.bottleneck)           # "compute" or "memory"
+```
 
-# Inspect per-operation breakdown
-for op_type, level, cost in result.per_op_costs:
-    print(f"  {op_type.value:30s} lvl={level:3d}  "
-          f"mult={cost.mult_cyc:>12,.0f} cyc  "
-          f"dram={cost.total_dram_bytes/1e6:.1f} MB")
+### Latency + Accuracy (unified API)
+
+```python
+result = sim.run(
+    plaintext_input="plaintext_input.txt",
+    expected_output="expected_output.txt",
+)
+
+# Latency
+print(f"Latency: {result.latency.predicted_latency_s * 1e3:.2f} ms")
+
+# Accuracy
+print(f"MAE:           {result.accuracy.mae:.6e}")
+print(f"Max error:     {result.accuracy.max_error:.6e}")
+print(f"Correct slots: {result.accuracy.correct_ratio:.2%}")
+
+# You can also pass numpy arrays directly
+import numpy as np
+result = sim.run(
+    plaintext_input=np.random.uniform(-1, 1, 16384),
+    expected_output=expected_values,
+    accuracy_threshold=0.01,  # per-slot correctness threshold
+)
 ```
 
 ### Compare architectures
@@ -80,39 +103,67 @@ from fhe_sim import Simulator, CPU_ARCH, GPU_ARCH, ASIC_ARCH
 
 for name, arch in [("CPU", CPU_ARCH), ("GPU", GPU_ARCH), ("ASIC", ASIC_ARCH)]:
     result = Simulator("sol.cpp", "sol.h", "config.json", arch=arch).run()
-    print(f"{name}: {result.predicted_latency_s * 1e3:.3f} ms  [{result.bottleneck}]")
+    print(f"{name}: {result.latency.predicted_latency_s * 1e3:.3f} ms")
+```
+
+### Use calibrated hardware parameters
+
+```python
+from fhe_sim import Simulator
+from fhe_sim.arch_params import ArchParam
+
+arch = ArchParam.load("fitted_arch.json")
+sim = Simulator("solution.cpp", "solution.h", "config.json", arch=arch)
+result = sim.run()
 ```
 
 ---
 
-## 3. Hardware Configuration
+## 3. `config.json` Format
+
+```json
+{
+    "mult_depth": 12,
+    "ring_dimension": 32768,
+    "scale_mod_size": 49,
+    "first_mod_size": 60,
+    "num_large_digits": 3,
+    "batch_size": 16384,
+    "enable_bootstrapping": false,
+    "levels_available_after_bootstrap": 10,
+    "level_budget": [4, 4],
+    "indexes_for_rotation_key": [1, 2, 4]
+}
+```
+
+Only `mult_depth` is strictly required. If `ring_dimension` is omitted, it is
+derived from the HE security standard table. Other fields have sensible
+defaults for CKKS.
+
+---
+
+## 4. Hardware Configuration
 
 ### `ArchParam` fields
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `funits` | int | Modular mul/add functional units per set |
-| `sets` | int | Independent sets of functional units (total parallelism = funits × sets) |
+| `sets` | int | Independent sets of functional units (total parallelism = funits x sets) |
 | `add_lat` | int | Pipeline initiation latency for additions (cycles) |
 | `mult_lat` | int | Pipeline initiation latency for multiplications (cycles) |
 | `ntt_lat` | int | Per-stage latency for dedicated NTT unit (if `dedicated_ntt_unit=True`) |
 | `auto_lat` | int | Pipeline initiation latency for automorphisms (cycles) |
-| `karatsuba` | bool | Use Karatsuba: 2 mults + 4 adds instead of 3 mults + 1 add per EvalMult |
+| `karatsuba` | bool | Use Karatsuba: 2 mults + 4 adds instead of 3 mults + 1 add |
 | `key_compression` | bool | Store one polynomial per key-switch key (halves key DRAM) |
-| `rescale_fusion` | bool | Fuse rescale into mod_down (saves one DRAM pass per EvalMult) |
+| `rescale_fusion` | bool | Fuse rescale into mod_down (saves one DRAM pass) |
 | `dedicated_ntt_unit` | bool | Model NTT with a separate hardware unit |
 | `cache_style` | CacheStyle | On-chip cache amount (NONE < CONST < BETA < ALPHA) |
 | `clock_freq_GHz` | float | Processor clock frequency |
-| `memory_bandwidth_GBps` | float | Usable DRAM bandwidth (reads + writes combined) |
-
-### `CacheStyle` enum
-
-| Value | Meaning |
-|-------|---------|
-| `NONE` | No cache; every limb round-trips through DRAM |
-| `CONST` | Small constant cache; eliminates a-term write-back before key-switch hoisting |
-| `BETA` | Cache holds dnum × alpha limbs; mod_raise intermediate stays on-chip per digit |
-| `ALPHA` | Cache holds alpha limbs; full BConv stays on-chip without DRAM round-trips |
+| `memory_bandwidth_GBps` | float | Usable DRAM bandwidth (GB/s) |
+| `per_rotate_overhead_s` | float | Fixed per-rotation overhead (seconds) |
+| `per_mult_overhead_s` | float | Fixed per-multiplication overhead (seconds) |
+| `per_add_overhead_s` | float | Fixed per-addition overhead (seconds) |
 
 ### Preset configurations
 
@@ -122,180 +173,110 @@ from fhe_sim import CPU_ARCH, GPU_ARCH, ASIC_ARCH
 # CPU_ARCH:  4 funits, 1 set, 3 GHz, 50 GB/s, no cache
 # GPU_ARCH:  128 funits, 16 sets, 1.5 GHz, 900 GB/s, no cache
 # ASIC_ARCH: 256 funits, 32 sets, 1 GHz, 200 GB/s, full alpha-cache,
-#             karatsuba + key_compression + rescale_fusion enabled
-```
-
-### Custom configuration
-
-```python
-from fhe_sim import ArchParam, CacheStyle
-
-my_arch = ArchParam(
-    funits=64, sets=8,
-    add_lat=2, mult_lat=8, ntt_lat=8, auto_lat=2,
-    karatsuba=True,
-    key_compression=False,
-    rescale_fusion=True,
-    dedicated_ntt_unit=False,
-    cache_style=CacheStyle.CONST,
-    clock_freq_GHz=2.0,
-    memory_bandwidth_GBps=300.0,
-)
-
-# Save and reload
-my_arch.save("my_arch.json")
-reloaded = ArchParam.load("my_arch.json")
+#            karatsuba + key_compression + rescale_fusion enabled
 ```
 
 ---
 
-## 4. Calibration Guide
+## 5. Calibration Guide
 
-Calibration fits the unknown hardware parameters (`funits × sets`, `add_lat`,
-`mult_lat`, `auto_lat`, and optionally `clock_freq_GHz`, `memory_bandwidth_GBps`)
-to real timing measurements using gradient-free Nelder-Mead optimisation.
+Calibration fits hardware parameters to real timing measurements using
+gradient-free Nelder-Mead optimisation.
 
-### What data to collect
+### Collect timing data
 
-Run your actual OpenFHE program and measure wall-clock time for the `eval()` call:
+Measure wall-clock time for the `eval()` call in your OpenFHE program:
 
 ```cpp
-auto start = std::chrono::high_resolution_clock::now();
-solution.eval(cc, ciphertexts, publicKey);
-auto end   = std::chrono::high_resolution_clock::now();
-double elapsed_s = std::chrono::duration<double>(end - start).count();
+auto t0 = std::chrono::high_resolution_clock::now();
+solver.eval();
+auto t1 = std::chrono::high_resolution_clock::now();
+double elapsed_s = std::chrono::duration<double>(t1 - t0).count();
 ```
 
-Collect measurements across **different configurations** (varying `mult_depth`, `N`,
-or operation mix) to ensure the optimiser can disentangle the parameters.
+Collect measurements across different configs (varying `mult_depth`, `N`, or
+operation mix) to give the optimiser enough signal.
 
 ### CSV format
 
-Create a CSV file with these columns:
-
 ```
 cpp_file,header_file,config_file,measured_time_s
-solution_d10.cpp,solution_d10.h,config_d10.json,0.00312
-solution_d20.cpp,solution_d20.h,config_d20.json,0.00891
-solution_d30.cpp,solution_d30.h,config_d30.json,0.02145
+solution.cpp,solution.h,config_d10.json,0.00312
+solution.cpp,solution.h,config_d20.json,0.00891
 ```
 
-### Step-by-step calibration example
+### Run calibration
 
 ```python
 from fhe_sim import calibrate, GPU_ARCH
-from fhe_sim.calibrate import load_entries_from_csv, save_calibration
-
-# 1. Load timing measurements
-entries = load_entries_from_csv("timings.csv")
-
-# 2. Calibrate — pin clock and bandwidth from hardware specs, fit parallelism + latencies
-fitted = calibrate(
-    entries             = entries,
-    arch_init           = GPU_ARCH,          # starting point
-    fix_clock_freq_GHz  = 1.41,              # from GPU spec sheet
-    fix_bandwidth_GBps  = 900.0,             # from GPU spec sheet
-    verbose             = True,
-)
-
-# 3. Save the calibrated parameters
-fitted.save("calibrated_gpu.json")
-print(f"Fitted: funits={fitted.funits}, sets={fitted.sets}")
-print(f"  add_lat={fitted.add_lat}, mult_lat={fitted.mult_lat}")
-```
-
-### Which parameters to fix vs. fit
-
-**Fix if known from hardware spec:**
-- `clock_freq_GHz` — usually available from the manufacturer
-- `memory_bandwidth_GBps` — usually available from the manufacturer or `nvidia-smi`
-
-**Fit from measurements:**
-- `funits × sets` (total parallelism) — depends on how many modular arithmetic
-  units are actually utilised for FHE workloads; hard to know from specs alone
-- `add_lat`, `mult_lat`, `auto_lat` — pipeline depths depend on the specific
-  implementation and compiler/runtime; fit these even if nominal clock is known
-
-**Keep fixed (algorithmic flags):**
-- `karatsuba`, `key_compression`, `rescale_fusion`, `cache_style` — these must
-  match what your actual OpenFHE build does; do not fit them automatically
-
-### How many data points are needed
-
-- **Minimum:** 5–10 measurements, ideally from different `mult_depth` and `N`
-  values, so the optimiser sees variation in both compute and memory cost.
-- **Recommended:** 15–30 measurements spanning a range of operation mixes
-  (rotate-heavy vs. mult-heavy workloads).
-
-### Common pitfalls
-
-**Warning — compute-bound training data:**
-If all your measurements are compute-bound (`bottleneck == "compute"`), the
-optimiser has no signal to fit `memory_bandwidth_GBps`. Use `fix_bandwidth_GBps`
-with the known spec value, or add memory-bound workloads (large `N`, low `dnum`).
-
-**Warning — memory-bound training data:**
-Conversely, if all measurements are memory-bound, `funits × sets` and latency
-terms are poorly constrained. Add smaller-`N` or ASIC-style workloads.
-
-**Checking fit quality:**
-```python
 from fhe_sim.calibrate import load_entries_from_csv
-from fhe_sim import Simulator
 
-fitted = ArchParam.load("calibrated_gpu.json")
-for entry in load_entries_from_csv("timings.csv"):
-    result = Simulator(entry.cpp_file, entry.header_file,
-                       entry.config_file, arch=fitted).run()
-    rel_err = abs(result.predicted_latency_s - entry.measured_time_s) \
-              / entry.measured_time_s
-    print(f"  {entry.cpp_file}: predicted={result.predicted_latency_s*1e3:.2f} ms  "
-          f"measured={entry.measured_time_s*1e3:.2f} ms  "
-          f"rel_err={rel_err*100:.1f}%")
+entries = load_entries_from_csv("timings.csv")
+fitted = calibrate(entries, arch_init=GPU_ARCH, verbose=True)
+fitted.save("calibrated.json")
 ```
 
----
-
-## 5. Runnable Calibration Example
-
-`example_calibrate.py` is a self-contained script that loads real timing data,
-runs calibration, and prints per-entry prediction accuracy:
+### Runnable example
 
 ```bash
-# From the project root
 python -m fhe_sim.example_calibrate
 ```
 
-It uses the timing measurements in `tools/calibration/timings_v111.csv` (20
-data points: 4 programs × 5 FHE configs) collected from OpenFHE v1.1.1 running
-inside Docker. The script will:
+Uses timing data from `tools/calibration/timings_v111.csv` collected from
+OpenFHE v1.1.1 in Docker.
 
-1. Load the CSV entries
-2. Fit 9 parameters (parallelism, pipeline latencies, clock, bandwidth,
-   per-operation overheads) via Nelder-Mead optimisation
-3. Save the fitted `ArchParam` to a JSON file
-4. Print a table of predicted vs. measured times with per-entry error and MAPE
+### How many data points
 
-See the source at [`fhe_sim/example_calibrate.py`](example_calibrate.py) for
-how to adapt this to your own timing data.
+- **Minimum:** 5-10 measurements with different `mult_depth` and `N`.
+- **Recommended:** 20-50 measurements spanning rotation-heavy, mult-heavy,
+  and add-heavy workloads.
 
 ---
 
-## 6. Files Reference
+## 6. Validation Results
+
+Validated against actual FHE runs (OpenFHE v1.1.1 in Docker) across 5
+programs and 5 CKKS configurations:
+
+### Accuracy branch
+
+| Metric | Result |
+|--------|--------|
+| Max Correct% disagreement (sim vs FHE) | **0.0000 pct pts** |
+| Max MAE disagreement (sim vs FHE) | **6.0e-11** |
+
+The simulator produces accuracy metrics identical to actual FHE to within
+the CKKS noise floor (~1e-10).
+
+### Latency branch (after calibration on 52 data points)
+
+| Metric | Result |
+|--------|--------|
+| MAPE | **17.9%** |
+| Spearman rho | **0.977** |
+
+The simulator correctly rank-orders program/config speed in 97.7% of
+pairwise comparisons.
+
+---
+
+## 7. Files Reference
 
 | File | Purpose |
 |------|---------|
 | `__init__.py` | Package entry point; re-exports main API |
+| `simulator.py` | `Simulator` — unified entry point returning `SimulationResult` |
+| `accuracy.py` | `NumericalInterpreter` — slot-level numpy executor; `AccuracyResult` |
+| `interpreter.py` | C++ parser (tree-sitter) producing FHE operation log with levels |
+| `cost_model.py` | `CostModel` maps op_log to `PredictionResult` via roofline model |
 | `arch_params.py` | `ArchParam`, `CacheStyle`, presets (`CPU_ARCH`, `GPU_ARCH`, `ASIC_ARCH`) |
-| `hw_model.py` | `Cost` dataclass; primitive cycle formulas (`poly_add`, `poly_mult`, `poly_ntt`, `poly_automorph`, `basis_convert`) |
-| `op_model.py` | Full FHE operation costs: `op_eval_add`, `op_eval_mult_ctpt`, `op_eval_mult_ctct`, `op_eval_rotate`; all DRAM accounting and cache-style checks |
-| `cost_model.py` | `CostModel` maps op_log → `PredictionResult`; roofline bottleneck analysis |
-| `simulator.py` | `Simulator` chains fhe_sim interpreter → CostModel |
-| `calibrate.py` | `calibrate()`, `CalibrationEntry`, `load_entries_from_csv()`, `save_calibration()`, `load_calibration()` |
-| `example_calibrate.py` | Runnable end-to-end calibration example (see Section 5) |
-| `README.md` | This file |
+| `hw_model.py` | `Cost` dataclass; primitive cycle formulas |
+| `op_model.py` | Full FHE operation costs with DRAM accounting |
+| `config.py` | `FHEConfig`, `load_config()` — FHE scheme parameter handling |
+| `types.py` | `FHEType`, `FHEOp`, `OpType`, `OpCount` |
+| `calibrate.py` | `calibrate()`, `CalibrationEntry`, CSV loader |
+| `example_calibrate.py` | Runnable calibration example |
 
-> The hardware cost model in fhe_sim (cycle counting, DRAM traffic accounting,
-> NTT butterfly model, and key-switch pipeline) is ported from
-> [SimFHE](https://github.com/bu-icsg/SimFHE) by Agrawal et al. Thanks to the SimFHE authors for
-> making their simulator publicly available.
+> The hardware cost model (cycle counting, DRAM traffic accounting, NTT
+> butterfly model, key-switch pipeline) is ported from
+> [SimFHE](https://github.com/bu-icsg/SimFHE) by Agrawal et al.
