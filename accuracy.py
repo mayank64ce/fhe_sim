@@ -11,7 +11,7 @@ No encryption, no polynomials — just slot-level arithmetic + optional noise.
 from __future__ import annotations
 import math
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Union
 
 import numpy as np
 
@@ -89,13 +89,21 @@ class NumericalInterpreter(Interpreter):
         member_types:           dict[str, FHEType],
         initial_level:          int,
         levels_after_bootstrap: int,
-        input_slots:            np.ndarray,
+        input_slots:            Union[np.ndarray, dict[str, np.ndarray]],
         scale_mod_size:         int = 50,
         noise_budget_bits:      float = 0.0,
     ):
         super().__init__(member_types, initial_level, levels_after_bootstrap)
-        self._input_slots = np.asarray(input_slots, dtype=np.float64)
-        self._num_slots = len(input_slots)
+
+        # Normalise input_slots to a dict {member_name: np.ndarray}
+        if isinstance(input_slots, dict):
+            self._input_map = {
+                k: np.asarray(v, dtype=np.float64)
+                for k, v in input_slots.items()
+            }
+        else:
+            self._input_map = {"m_InputC": np.asarray(input_slots, dtype=np.float64)}
+
         self._scale_mod_size = scale_mod_size
 
         # Noise injection: sigma per rescale ≈ sqrt(N_ring) / 2^scale_mod_size
@@ -121,8 +129,11 @@ class NumericalInterpreter(Interpreter):
         if body is None:
             raise ValueError("Could not find eval() function definition.")
 
+        # Seed all input ciphertext members with their numpy arrays
+        env = {name: arr.copy() for name, arr in self._input_map.items()}
+
         ctx = ExecContext(
-            env       = {"m_InputC": self._input_slots.copy()},
+            env       = env,
             type_env  = dict(self._global_type_env),
             level_env = dict(self._global_level_env),
         )
@@ -130,6 +141,78 @@ class NumericalInterpreter(Interpreter):
 
         self.output_slots = ctx.env.get("m_OutputC")
         return self.op_log
+
+    # -- Override: array subscript read/write with compound keys -------------
+
+    def _eval_expr(self, node, ctx):
+        if node is None:
+            return None, FHEType.UNKNOWN, None
+
+        # Subscript read: out[0] → look up "out__0" in env
+        if node.type == "subscript_expression":
+            from .interpreter import _text
+            arr_node  = node.child_by_field_name("argument")
+            indices_n = node.child_by_field_name("indices")
+            idx_node  = (next((c for c in indices_n.children if c.is_named), None)
+                         if indices_n else None)
+            arr_name = _text(arr_node) if arr_node else None
+
+            fhe_t = (ctx.type_env.get(arr_name,
+                     self._global_type_env.get(arr_name, FHEType.PLAIN))
+                     if arr_name else FHEType.UNKNOWN)
+
+            lvl = None
+            val = None
+            if arr_name and idx_node:
+                idx_val, _, _ = self._eval_expr(idx_node, ctx)
+                if idx_val is not None:
+                    compound = f"{arr_name}__{int(idx_val)}"
+                    val = ctx.env.get(compound)
+                    if fhe_t == FHEType.CIPHERTEXT:
+                        lvl = ctx.level_env.get(compound,
+                              ctx.level_env.get(arr_name,
+                              self._global_level_env.get(arr_name,
+                              self._initial_level)))
+                else:
+                    val = ctx.env.get(arr_name)
+                    if fhe_t == FHEType.CIPHERTEXT:
+                        lvl = ctx.level_env.get(arr_name,
+                              self._global_level_env.get(arr_name,
+                              self._initial_level))
+            return val, fhe_t, lvl
+
+        # Assignment: for subscript LHS, use compound key in env
+        if node.type == "assignment_expression":
+            from .interpreter import _text
+            lhs = node.child_by_field_name("left")
+            rhs = node.child_by_field_name("right")
+            val, fhe_t, lvl = self._eval_expr(rhs, ctx)
+
+            lhs_name = self._lhs_name(lhs)
+            lvl_key  = self._lhs_level_key(lhs, ctx)
+
+            # For subscript LHS, compute compound env key
+            env_key = lhs_name
+            if lhs is not None and lhs.type == "subscript_expression":
+                arr_node  = lhs.child_by_field_name("argument")
+                indices_n = lhs.child_by_field_name("indices")
+                idx_node  = (next((c for c in indices_n.children if c.is_named), None)
+                             if indices_n else None)
+                if arr_node and idx_node:
+                    idx_val, _, _ = self._eval_expr(idx_node, ctx)
+                    if idx_val is not None:
+                        env_key = f"{_text(arr_node)}__{int(idx_val)}"
+
+            if lhs_name:
+                if fhe_t not in (FHEType.PLAIN, FHEType.UNKNOWN):
+                    ctx.type_env[lhs_name] = fhe_t
+                if self._should_store_value(fhe_t, val) and env_key:
+                    ctx.env[env_key] = val
+            if lvl_key and fhe_t == FHEType.CIPHERTEXT and lvl is not None:
+                ctx.level_env[lvl_key] = lvl
+            return val, fhe_t, lvl
+
+        return super()._eval_expr(node, ctx)
 
     # -- Override: execute FHE calls numerically ----------------------------
 

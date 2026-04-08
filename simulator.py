@@ -7,6 +7,7 @@ from typing import Optional, Union
 import numpy as np
 
 from .config import load_config, FHEConfig
+from .types import FHEType
 from .interpreter import Interpreter, extract_member_types
 from .accuracy import NumericalInterpreter, AccuracyResult
 from .arch_params import ArchParam, GPU_ARCH
@@ -71,7 +72,7 @@ class Simulator:
     def run(
         self,
         test_case:        Optional[Union[str, Path]] = None,
-        plaintext_input:  Optional[Union[str, Path, np.ndarray]] = None,
+        plaintext_input:  Optional[Union[str, Path, np.ndarray, dict]] = None,
         expected_output:  Optional[Union[str, Path, np.ndarray]] = None,
         accuracy_threshold: float = 0.001,
         run_index:        int = 0,
@@ -83,7 +84,8 @@ class Simulator:
         ----------
         test_case          : path to test_case.json (extracts input, output,
                              and threshold automatically)
-        plaintext_input    : path to plaintext_input.txt or numpy array
+        plaintext_input    : path to plaintext_input.txt, numpy array, or
+                             dict mapping member names to numpy arrays
                              (ignored if test_case is provided)
         expected_output    : path to expected_output.txt or numpy array
                              (ignored if test_case is provided)
@@ -101,7 +103,14 @@ class Simulator:
         cpp_src      = self.cpp_file.read_text()
 
         if plaintext_input is not None:
-            input_slots = self._load_array(plaintext_input)
+            # Normalise to dict {member_name: np.ndarray}
+            if isinstance(plaintext_input, dict):
+                input_slots = {
+                    k: self._load_array(v) for k, v in plaintext_input.items()
+                }
+            else:
+                input_slots = self._load_array(plaintext_input)
+
             num_interp = NumericalInterpreter(
                 member_types           = member_types,
                 initial_level          = config.mult_depth,
@@ -139,12 +148,12 @@ class Simulator:
             latency = CostModel(self.arch).predict(op_log, config)
             return SimulationResult(latency=latency)
 
-    @staticmethod
     def _load_test_case(
+        self,
         path: Union[str, Path],
         run_index: int = 0,
         default_threshold: float = 0.001,
-    ) -> tuple[np.ndarray, np.ndarray, float]:
+    ) -> tuple[dict[str, np.ndarray], np.ndarray, float]:
         """
         Load input/output from a test_case.json file.
 
@@ -159,7 +168,8 @@ class Simulator:
             }]
         }]
 
-        Returns (plaintext_input, expected_output, threshold) as numpy arrays.
+        Returns (input_dict, expected_output, threshold).
+        input_dict maps header Ciphertext member names → numpy arrays.
         """
         with open(str(path)) as f:
             data = json.load(f)
@@ -167,8 +177,33 @@ class Simulator:
         tc = data[0]
         run = tc["runs"][run_index]
 
-        # Input: first input vector
-        plaintext_input = np.array(run["input"][0]["value"], dtype=np.float64)
+        # Get input Ciphertext member names from header (excluding m_OutputC)
+        member_types = extract_member_types(self.header_file.read_text())
+        ct_input_members = [
+            name for name, t in member_types.items()
+            if t == FHEType.CIPHERTEXT and name != "m_OutputC"
+        ]
+
+        # Map test_case inputs to header members by order
+        inputs_json = run["input"]
+        input_dict: dict[str, np.ndarray] = {}
+
+        if len(inputs_json) == 1 and len(ct_input_members) == 1:
+            # Single input — direct mapping
+            input_dict[ct_input_members[0]] = np.array(
+                inputs_json[0]["value"], dtype=np.float64
+            )
+        elif len(inputs_json) == len(ct_input_members):
+            # Multi-input — match by order
+            for member_name, inp in zip(ct_input_members, inputs_json):
+                input_dict[member_name] = np.array(
+                    inp["value"], dtype=np.float64
+                )
+        else:
+            # Fallback: single input as m_InputC
+            input_dict["m_InputC"] = np.array(
+                inputs_json[0]["value"], dtype=np.float64
+            )
 
         # Output
         expected_output = np.array(run["output"], dtype=np.float64)
@@ -176,7 +211,7 @@ class Simulator:
         # Threshold
         threshold = tc.get("accuracy_threshold", default_threshold)
 
-        return plaintext_input, expected_output, threshold
+        return input_dict, expected_output, threshold
 
     @staticmethod
     def _load_array(source: Union[str, Path, np.ndarray]) -> np.ndarray:
